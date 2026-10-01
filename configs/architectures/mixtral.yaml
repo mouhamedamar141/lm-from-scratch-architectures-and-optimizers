@@ -1,0 +1,2 @@
+# Style Mixtral : LLaMA/Mistral avec FFN remplacé par 8 experts, top-2, routeur softmax + perte d'équilibrage.
+model: {position_mode: rope, norm_type: rmsnorm, ffn_type: swiglu, attn_type: gqa, n_kv_head: 2, moe: true, n_experts: 8, top_k: 2, expert_hidden: 48, router: softmax, balance_coef: 0.01}

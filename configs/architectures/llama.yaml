@@ -1,0 +1,2 @@
+# Style LLaMA : RoPE, RMSNorm Pre-LN, SwiGLU, sans biais, GQA.
+model: {position_mode: rope, norm_type: rmsnorm, ffn_type: swiglu, bias: false, attn_type: gqa, n_kv_head: 2}

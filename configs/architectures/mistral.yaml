@@ -1,0 +1,2 @@
+# Style Mistral 7B : LLaMA + fenêtre glissante d'attention.
+model: {position_mode: rope, norm_type: rmsnorm, ffn_type: swiglu, attn_type: gqa, n_kv_head: 2, window: 16}

@@ -1,0 +1,2 @@
+# Style DeepSeek-V3 (très réduit) : MLA, experts fins + 1 expert partagé, routeur sigmoïde à biais sans perte auxiliaire, 1 couche dense.
+model: {position_mode: rope, norm_type: rmsnorm, ffn_type: swiglu, attn_type: mla, kv_lora_rank: 16, rope_head_dim: 8, q_lora_rank: 16, moe: true, n_experts: 16, top_k: 4, n_shared_experts: 1, expert_hidden: 16, router: sigmoid_bias, n_dense_layers: 1}

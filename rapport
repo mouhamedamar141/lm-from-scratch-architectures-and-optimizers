@@ -1,0 +1,725 @@
+# Rapport théorique : des tokenizers aux LLM modernes
+
+**Plan** : chaque partie suit le même schéma : **problème → solution → équations → variantes comparées → ce que disent les expériences du dépôt**.
+
+1. Définition, utilité et cadre mathématique des LLM
+2. Tokenisation (BPE, BPE octets, WordPiece, Unigram)
+3. Embeddings
+4. Encodages de position (sinusoïdal, appris, RoPE, ALiBi, NoPE, extension de contexte)
+5. Attention (MHA, MQA, GQA, MLA, fenêtre glissante, QK-Norm, FlashAttention)
+6. KV cache
+7. Normalisations et connexions résiduelles
+8. Réseaux feed-forward (ReLU, GELU, SwiGLU…)
+9. Mixture of Experts
+10. Le Transformer complet : paramètres et calcul
+11. Entraînement : optimiseurs, schedules, stabilité, précision
+12. Génération : échantillonnage et décodage spéculatif
+13. Panorama des LLM modernes
+14. Méthodologie et résultats du dépôt (avec leurs limites)
+15. Références
+
+## 1. Définition, utilité et cadre mathématique
+
+### 1.1 Qu'est-ce qu'un LLM ?
+
+Un **modèle de langage** est un modèle probabiliste de séquences de symboles (tokens) $x_1,\dots,x_T$. Un **grand modèle de langage (LLM)** est un modèle de langage de type réseau de neurones profond (aujourd'hui presque toujours un **Transformer décodeur**) avec des milliards de paramètres, entraîné sur des corpus de milliers de milliards de tokens.
+
+Le modèle autorégressif s'appuie sur la règle de factorisation de la probabilité :
+
+$$
+p_\theta(x_1,\dots,x_T)=\prod_{t=1}^{T}p_\theta(x_t\mid x_{<t}).
+$$
+
+Le réseau calcule, pour chaque position $t$, un vecteur de **logits** $z_t\in\mathbb R^{V}$ ($V$ = taille du vocabulaire). La distribution du token suivant est :
+
+$$
+p_\theta(x_t=i\mid x_{<t})=\mathrm{softmax}(z_t)_i=\frac{e^{z_{t,i}}}{\sum_{j=1}^{V}e^{z_{t,j}}}.
+$$
+
+### 1.2 Fonction de perte et métriques
+
+L'entraînement minimise l'**entropie croisée** (log-vraisemblance négative moyenne) :
+
+$$
+\mathcal L(\theta)=-\frac1T\sum_{t=1}^{T}\log p_\theta(x_t\mid x_{<t}).
+$$
+
+- **Perplexité** : $\mathrm{PPL}=e^{\mathcal L}$. C'est le « nombre effectif de choix équiprobables » à chaque pas.
+- **Bits par token** : $\mathcal L/\ln 2$.
+- **Bits par octet** : $\mathrm{BPB}=\dfrac{\mathcal L\cdot N_{\text{tokens}}}{N_{\text{octets}}\ln 2}$. C'est la seule métrique équitable pour **comparer des tokenizers différents**, car la perte par token dépend de la granularité des tokens.
+
+### 1.3 Pourquoi ça marche, et à quoi ça sert
+
+Prédire le token suivant force le modèle à apprendre la syntaxe, des faits, des régularités logiques et des styles, parce que tout cela réduit la perte. Un même modèle pré-entraîné peut ensuite être adapté (affinage, instructions, préférences) ou utilisé par prompt.
+
+Utilités typiques : génération et résumé de texte, traduction, question-réponse, code, extraction d'information, agents.
+
+### 1.4 Limites à garder en tête
+
+- Le modèle optimise la vraisemblance, **pas la vérité** : il peut produire des affirmations fausses mais plausibles.
+- Le contexte est borné ; la mémoire et le calcul d'inférence croissent avec la longueur du contexte.
+- Les performances dépendent des données, de l'échelle et des choix d'architecture. Ce rapport traite ces derniers.
+
+### 1.5 Vue d'ensemble de l'architecture
+
+$$
+\text{texte}\xrightarrow{\text{tokenizer}}(t_1..t_T)\xrightarrow{\text{embedding}+\text{position}}H^{(0)}\xrightarrow{N\times\text{bloc}}H^{(N)}\xrightarrow{\text{norme}+\text{tête}}\text{logits}
+$$
+
+Un bloc = **attention** (mélange entre positions) + **FFN ou MoE** (transformation par position), avec normalisations et connexions résiduelles.
+
+---
+
+## 2. Tokenisation
+
+### 2.1 Le problème
+
+Un réseau manipule des nombres, pas du texte. Il faut découper le texte en unités et les numéroter. Trois extrêmes :
+
+| Découpage | Vocabulaire $V$ | Longueur $L$ | Inconvénient |
+|---|---|---|---|
+| Caractère | très petit | très longue | séquences longues : attention coûteuse, dépendances lointaines |
+| Mot | énorme | courte | mots inconnus (OOV), vocabulaire creux, pas de partage morphologique |
+| **Sous-mot** | moyen (fixé) | courte à moyenne | compromis utilisé par tous les LLM |
+
+### 2.2 Le compromis quantifié
+
+Si le texte a $N$ caractères et que le tokenizer compresse d'un facteur $c$ (caractères par token) :
+
+$$
+L\approx\frac{N}{c},\qquad \text{coût d'attention}\propto L^2,\qquad \text{paramètres d'embedding}=V\,d\ (\text{ou }2Vd\text{ sans partage}).
+$$
+
+Augmenter $V$ augmente $c$ (séquences plus courtes, cache KV plus petit), mais alourdit les embeddings et le softmax de sortie ($O(Vd)$ par token). Cela rend aussi les tokens rares mal entraînés.
+
+### 2.3 BPE (Byte Pair Encoding)
+
+**Idée** : partir des caractères et fusionner itérativement la paire adjacente la plus fréquente.
+
+Vocabulaire initial $\mathcal V_0$ (symboles). Pour $t=1,\dots,M$ :
+
+$$
+(a^\star,b^\star)=\arg\max_{(a,b)}\ \mathrm{count}_{\mathcal C}(a,b),\qquad \mathcal V_t=\mathcal V_{t-1}\cup\{a^\star b^\star\}.
+$$
+
+On remplace ensuite toutes les occurrences de $(a^\star,b^\star)$ par le nouveau symbole.
+
+- **Encodage** : on rejoue les fusions dans l'ordre d'apprentissage. L'ordre des fusions *est* le modèle.
+- **Coût naïf** d'entraînement : $O(M\cdot|\mathcal C|)$.
+- **Pré-tokenisation** : un découpage préalable en « mots » (par expression régulière) interdit les fusions à travers espaces et ponctuation.
+
+### 2.4 BPE au niveau des octets
+
+**Problème** : le BPE sur caractères produit `<unk>` pour un caractère absent du corpus (emoji, idéogramme rare).
+
+**Solution** : prendre pour symboles de base les 256 octets UTF-8. Tout texte est alors encodable, sans `<unk>`.
+
+**Coût** : les scripts non latins consomment plusieurs octets par caractère, donc plus de tokens avant fusion.
+
+### 2.5 WordPiece
+
+Même schéma ascendant, mais le critère de fusion est un score de type information mutuelle :
+
+$$
+\mathrm{score}(a,b)=\frac{n(a,b)}{n(a)\,n(b)}.
+$$
+
+Ce score favorise les paires dont les composants sont rares hors de la paire, alors que BPE ne regarde que $n(a,b)$. L'encodage est glouton : plus long préfixe présent dans le vocabulaire, avec le préfixe `##` pour les sous-mots non initiaux.
+
+### 2.6 Unigram LM
+
+**Approche descendante** : partir d'un grand vocabulaire de candidats, puis élaguer. Un modèle unigramme définit la probabilité d'une segmentation $x=(x_1,\dots,x_m)$ :
+
+$$
+P(x)=\prod_{i=1}^{m}p(x_i),\qquad x^\star(s)=\arg\max_{x\in\mathcal S(s)}P(x)\ \ (\text{Viterbi}).
+$$
+
+Les $p(x_i)$ sont appris par EM en maximisant $\sum_s\log\sum_{x\in\mathcal S(s)}P(x)$. À chaque étape, on retire les unités dont la suppression dégrade le moins cette vraisemblance. Particularité : plusieurs segmentations sont possibles, ce qui permet la **régularisation par échantillonnage de segmentations**.
+
+Dans le dépôt, Unigram est une **approximation pédagogique** (EM « dur » plus élagage), pas SentencePiece.
+
+### 2.7 Comparaison
+
+| | BPE octets | BPE caractères | WordPiece | Unigram |
+|---|---|---|---|---|
+| `<unk>` possible | non | oui | oui | oui |
+| Critère | fréquence | fréquence | rapport de vraisemblance | vraisemblance globale |
+| Encodage | règles ordonnées | règles ordonnées | glouton | Viterbi (ou échantillonnage) |
+| Usage typique | GPT-2/3/4, Llama 3 | pédagogique | BERT | SentencePiece |
+
+**Pièges méthodologiques** : comparer « à taille de vocabulaire égale » est trompeur pour les octets (256 symboles de base). Il faut préciser le nombre de fusions. La compression n'est comparable que sur des caractères connus de tous les tokenizers : un mot inconnu remplacé par un seul `<unk>` gonfle artificiellement la compression.
+
+---
+
+## 3. Embeddings
+
+### 3.1 Problème et solution
+
+Un identifiant entier n'a pas de sens géométrique. On associe à chaque token un vecteur appris de dimension $d$.
+
+Table $E\in\mathbb R^{V\times d}$, et $x_t=E_{\,t_t}$, ce qui équivaut à $\mathrm{onehot}(t_t)\,E$ sans construire le one-hot. Le gradient ne touche **que les lignes des tokens présents** dans le lot. C'est pourquoi les tokens rares sont mal appris.
+
+### 3.2 Le sens vient du contexte
+
+Des tokens qui apparaissent dans des contextes proches reçoivent des vecteurs proches (hypothèse distributionnelle). Une SVD de la matrice PPMI des co-occurrences en est la version « sans réseau » :
+
+$$
+\mathrm{PPMI}(w,c)=\max\!\Big(0,\log\frac{p(w,c)}{p(w)p(c)}\Big).
+$$
+
+### 3.3 Weight tying
+
+La tête de sortie calcule $z=hW_{\text{out}}$ avec $W_{\text{out}}\in\mathbb R^{d\times V}$. Le **partage de poids** impose $W_{\text{out}}=E^\top$, ce qui économise $Vd$ paramètres.
+
+### 3.4 Échelle des embeddings
+
+Le Transformer original multiplie les embeddings par $\sqrt d$ avant d'ajouter les positions sinusoïdales. Sans cela, avec une initialisation d'écart-type $0{,}02$, une table sinusoïdale (amplitude $\sim1$) **écrase** l'information du token. Le dépôt l'a mesuré : perte $2{,}74$ sans échelle contre $1{,}22$ avec $\sqrt d$.
+
+---
+
+## 4. Encodages de position
+
+### 4.1 Le problème
+
+L'auto-attention est **équivariante aux permutations** : si l'on permute les tokens d'entrée, les sorties sont permutées de la même façon. Sans information de position, « le chat chasse le chien » et « le chien chasse le chat » ne se distinguent pas. Il faut injecter l'ordre.
+
+### 4.2 Positions absolues
+
+**Sinusoïdales** (Transformer original) :
+
+$$
+PE_{p,2i}=\sin\!\Big(\frac{p}{10000^{2i/d}}\Big),\qquad PE_{p,2i+1}=\cos\!\Big(\frac{p}{10000^{2i/d}}\Big),\qquad x_p\leftarrow x_p+PE_p.
+$$
+
+Sans paramètre. La position relative $p+k$ s'exprime comme une transformation linéaire de $PE_p$.
+
+**Apprises** (GPT-2) : $x_p\leftarrow x_p+P_p$ avec $P\in\mathbb R^{L\times d}$. Flexible, mais la longueur maximale est figée et il n'y a pas d'extrapolation.
+
+### 4.3 RoPE (Rotary Position Embedding)
+
+**Idée** : au lieu d'ajouter la position à l'entrée, **tourner** $q$ et $k$ dans l'attention, de façon que le produit scalaire ne dépende que de la distance.
+
+Pour chaque paire de coordonnées $(2i,2i+1)$, soit $R(\phi)=\begin{pmatrix}\cos\phi&-\sin\phi\\ \sin\phi&\cos\phi\end{pmatrix}$ et $\theta_i=\theta_{\text{base}}^{-2i/d}$. On pose $\tilde q_m=R_m q$, $\tilde k_n=R_n k$, où $R_m$ applique la rotation d'angle $m\theta_i$ à la $i$-ème paire. Alors :
+
+$$
+\tilde q_m^{\top}\tilde k_n=q^{\top}R_m^{\top}R_n\,k=q^{\top}R_{\,n-m}\,k.
+$$
+
+Le score ne dépend que du décalage $n-m$ (propriété **relative**) et la rotation conserve la norme.
+
+- Les premières paires tournent vite (information locale), les dernières très lentement (longue portée).
+- $k$ est mis en cache **après** rotation, car sa position absolue est fixe.
+
+### 4.4 ALiBi
+
+On n'ajoute aucune position aux embeddings. On pénalise les scores linéairement avec la distance :
+
+$$
+s_{ij}=\frac{q_i^\top k_j}{\sqrt{d_h}}-m_h\,(i-j),\qquad m_h=2^{-8h/H}\ (h=1,\dots,H).
+$$
+
+Chaque tête a une pente différente, donc des portées différentes. L'extrapolation est native, avec un fort biais de récence.
+
+### 4.5 NoPE
+
+Aucune information de position. Dans un décodeur, le **masque causal** permet au modèle de déduire l'ordre (le nombre de tokens visibles varie avec la position). Reste à éprouver à grande échelle.
+
+### 4.6 Étendre le contexte de RoPE
+
+**Problème** : un modèle entraîné à la longueur $L$ se dégrade au-delà (angles jamais vus). Soit $s=L_{\text{cible}}/L_{\text{train}}$.
+
+- **Interpolation de positions (PI)** : $\theta_i\leftarrow\theta_i/s$. Toutes les fréquences sont ralenties. Il faut un court fine-tuning.
+- **NTK-aware** : $\theta_{\text{base}}\leftarrow\theta_{\text{base}}\,s^{d/(d-2)}$. Les hautes fréquences bougent peu et les basses beaucoup.
+- **YaRN** : interpolation **par bande**. Le nombre de tours $r_i=L_{\text{train}}\theta_i/2\pi$ fixe un coefficient $\gamma_i=\mathrm{clip}\big(\frac{r_i-\alpha}{\beta-\alpha},0,1\big)$ :
+$$
+\theta_i'=(1-\gamma_i)\frac{\theta_i}{s}+\gamma_i\,\theta_i,
+$$
+  avec une température d'attention $\sqrt{1/t}=0{,}1\ln s+1$ appliquée aux logits.
+
+Un autre levier consiste à augmenter $\theta_{\text{base}}$ dès l'entraînement (Llama 3 utilise $5\times10^5$).
+
+### 4.7 Comparaison
+
+| Méthode | Avantage | Limite |
+|---|---|---|
+| Appris | simple | longueur figée |
+| Sinusoïdal | sans paramètre | longueur figée en pratique ; attention à l'échelle des embeddings |
+| **RoPE** | relative, extensible (PI/NTK/YaRN), standard | extrapolation brute limitée |
+| ALiBi | extrapole nativement | biais de récence fort |
+| NoPE | aucun mécanisme | peu éprouvé à grande échelle |
+
+---
+
+## 5. Attention
+
+### 5.1 Le problème
+
+Chaque position doit pouvoir récupérer de l'information dans les positions précédentes, de façon sélective et dépendante du contenu.
+
+### 5.2 Attention à produit scalaire normalisé
+
+Pour $X\in\mathbb R^{T\times d}$ : $Q=XW_Q,\ K=XW_K,\ V=XW_V$.
+
+$$
+\mathrm{Attn}(Q,K,V)=\mathrm{softmax}\!\Big(\frac{QK^\top}{\sqrt{d_h}}+M\Big)V,\qquad
+M_{ij}=\begin{cases}0&j\le i\\-\infty&j>i\end{cases}.
+$$
+
+- **Masque causal $M$** : un token ne voit pas le futur (nécessaire pour l'autorégression).
+- **Facteur $1/\sqrt{d_h}$** : si $q,k$ ont des composantes de variance $1$, alors $\mathrm{Var}(q^\top k)=d_h$. Sans normalisation, le softmax sature et les gradients s'annulent.
+- **Multi-têtes** : $h$ têtes indépendantes de dimension $d_h=d/h$, concaténées puis projetées par $W_O$ :
+$$
+\mathrm{MHA}(X)=\mathrm{Concat}(\mathrm{head}_1,\dots,\mathrm{head}_h)\,W_O.
+$$
+
+**Coût** : le temps est $O(T^2d)$ et la matrice de scores occupe $O(T^2)$ en mémoire.
+
+### 5.3 FlashAttention
+
+Même résultat **exact**, mais calculé par blocs en mémoire rapide (SRAM) avec un softmax « en ligne » (les maxima et sommes sont mis à jour bloc par bloc). La mémoire passe de $O(T^2)$ à $O(T)$ et on économise des accès mémoire. Il n'y a **aucune approximation** ; c'est une optimisation d'implémentation (en PyTorch : `scaled_dot_product_attention`).
+
+### 5.4 Le vrai goulot : le cache KV à l'inférence
+
+Voir section 6. Les variantes MQA, GQA et MLA réduisent la taille du cache.
+
+### 5.5 MQA et GQA
+
+- **MHA** : $h$ têtes $Q$, $h$ têtes $K,V$. Cache par token et par couche : $2\,h\,d_h$.
+- **MQA** : une seule paire $K,V$ partagée. Cache $2\,d_h$ ($h\times$ moins), au prix d'une perte de qualité.
+- **GQA** : $g$ groupes ($1<g<h$), chaque groupe de $h/g$ têtes $Q$ partageant une paire $K,V$. Cache $2\,g\,d_h$. C'est le compromis adopté par les LLM ouverts récents (Llama 2 70B, Llama 3, Mistral, Qwen).
+
+Paramètres d'attention par couche (avec $d=hd_h$) : $2d^2+2\,d\,g\,d_h$, contre $4d^2$ pour MHA.
+
+### 5.6 MLA (Multi-head Latent Attention, DeepSeek)
+
+**Idée** : compresser $K$ et $V$ dans un **latent** de faible dimension $d_c$, mis en cache à la place des têtes complètes.
+
+$$
+c_t=W^{DKV}x_t\in\mathbb R^{d_c},\qquad k^C_t=W^{UK}c_t,\qquad v_t=W^{UV}c_t.
+$$
+
+RoPE ne se laisse pas « absorber » dans le latent. On ajoute donc une petite clé **partagée** portant la position : $k^R_t=\mathrm{RoPE}(W^{KR}x_t)\in\mathbb R^{d_h^R}$, et la clé de la tête $i$ est $[\,k^C_{t,i};\,k^R_t\,]$. Même découplage côté requête.
+
+**Cache par token et par couche** : $d_c+d_h^R$ valeurs. À l'inférence, $q^\top k^C=(W^{UK\top}q)^\top c$ permet de calculer l'attention directement dans l'espace latent. Cette **absorption** des matrices n'est pas reproduite dans le dépôt (version « naïve » qui reconstruit $K,V$).
+
+### 5.7 Fenêtre glissante
+
+$M_{ij}=0$ si $0\le i-j<W$, sinon $-\infty$. La mémoire du cache est bornée à $W$ tokens (cache roulant). Par empilement, le champ réceptif atteint environ $N\cdot W$ après $N$ couches. Utilisé par Mistral 7B ($W=4096$). Une variante consiste à conserver aussi les premiers tokens (« attention sinks », StreamingLLM) pour stabiliser les générations très longues.
+
+### 5.8 QK-Norm
+
+On normalise $q$ et $k$ (RMSNorm sur la dimension de tête) avant le produit scalaire, ce qui **borne les logits d'attention** et évite leur explosion à grande échelle ou à learning rate élevé (ViT-22B, Gemma 3, Qwen3).
+
+### 5.9 Comparaison
+
+| Variante | Cache / token / couche | Idée | Coût |
+|---|---|---|---|
+| MHA | $2hd_h$ | référence | mémoire |
+| GQA ($g$) | $2gd_h$ | têtes $K,V$ partagées par groupe | un peu de qualité |
+| MQA | $2d_h$ | une seule tête $K,V$ | plus de qualité perdue |
+| MLA | $d_c+d_h^R$ | latent compressé | complexité, paramètres en plus |
+| Fenêtre $W$ | $\le 2gd_hW$ | portée locale | perte de portée directe |
+
+---
+
+## 6. KV cache
+
+### 6.1 Le problème
+
+En génération, à chaque nouveau token on ne devrait pas retraiter tout le préfixe. Sans cache, le pas $t$ recalcule les projections de $t$ tokens, soit $O(T^2)$ tokens traités au total pour générer $T$ tokens.
+
+### 6.2 Principe
+
+Le token $t$ n'a besoin que de **sa** requête $q_t$. Les clés et valeurs passées sont mémorisées :
+
+$$
+o_t=\mathrm{softmax}\!\Big(\frac{q_t K_{\le t}^\top}{\sqrt{d_h}}\Big)V_{\le t},\qquad K_{\le t}=[K_{<t};\,k_t],\quad V_{\le t}=[V_{<t};\,v_t].
+$$
+
+Chaque pas traite $O(1)$ token (l'attention reste $O(t)$).
+
+**Phases** : préremplissage (*prefill*) du prompt en parallèle, puis décodage pas à pas.
+
+### 6.3 Mémoire
+
+Pour un lot $B$, $T$ tokens, $n_L$ couches, $b$ octets par valeur :
+
+$$
+\mathrm{Mém}_{\mathrm{KV}}=B\cdot T\cdot n_L\cdot\underbrace{2\,n_{kv}\,d_h}_{\text{valeurs/token/couche}}\cdot b.
+$$
+
+D'après les configurations publiées :
+
+- Llama-2-7B (32 couches, 32 têtes, $d_h=128$, bf16) : environ 0,5 Mio par token, soit 2 Gio pour 4096 tokens.
+- Llama-3-8B (32 couches, 8 têtes KV) : environ 128 Kio par token, soit 4 Gio pour 32 768 tokens.
+- Pour un modèle de type DeepSeek-V2, le latent MLA ($d_c=512$, $d_h^R=64$) contre MHA à 128 têtes de 128 donne un facteur d'environ $57$ sur le cache par token et par couche.
+
+Le décodage est **limité par la bande passante mémoire** : à chaque pas, tous les poids et tout le cache sont lus pour un seul token. D'où l'importance de réduire le cache.
+
+### 6.4 Leviers
+
+| Levier | Gain | Risque |
+|---|---|---|
+| GQA/MQA | $h/g$ | qualité |
+| MLA | $\approx 2hd_h/(d_c+d_h^R)$ | complexité |
+| Fenêtre / cache roulant | mémoire bornée | portée |
+| Quantification (int8/int4) | $32/b$ (ou $16/b$ en bf16) | erreur d'arrondi |
+| PagedAttention (vLLM) | moins de fragmentation, partage de préfixes | ingénierie serveur |
+
+La quantification symétrique par vecteur suit $\hat x=\mathrm{round}(x/s)\,s$, avec $s=\max|x|/(2^{b-1}-1)$.
+
+---
+
+## 7. Normalisations et connexions résiduelles
+
+### 7.1 Le problème
+
+Dans un réseau profond, la distribution des activations dérive d'une couche à l'autre et les gradients deviennent instables. On normalise les activations et on ajoute des chemins résiduels $x_{l+1}=x_l+F(x_l)$ qui facilitent la propagation du gradient.
+
+### 7.2 LayerNorm et RMSNorm
+
+$$
+\mathrm{LN}(x)=\frac{x-\mu}{\sqrt{\sigma^2+\varepsilon}}\odot\gamma+\beta,\qquad \mu=\tfrac1d\sum_i x_i,\quad \sigma^2=\tfrac1d\sum_i(x_i-\mu)^2
+$$
+
+$$
+\mathrm{RMSNorm}(x)=\frac{x}{\sqrt{\tfrac1d\sum_i x_i^2+\varepsilon}}\odot\gamma.
+$$
+
+RMSNorm supprime le recentrage et le biais : moins de calcul, invariance d'échelle, pas de perte de qualité notable. C'est le standard (LLaMA, Mistral, Qwen, DeepSeek). Les statistiques se calculent en fp32 pour la stabilité.
+
+### 7.3 Pre-LN contre Post-LN
+
+$$
+\text{Post-LN :}\ x_{l+1}=\mathrm{Norm}\big(x_l+F(x_l)\big)\qquad\qquad
+\text{Pre-LN :}\ x_{l+1}=x_l+F\big(\mathrm{Norm}(x_l)\big).
+$$
+
+En Pre-LN, la jacobienne entre deux couches contient un terme identité : $\dfrac{\partial x_N}{\partial x_l}=I+\cdots$. Le gradient a donc un chemin direct jusqu'à l'entrée, ce qui rend l'entraînement plus stable et moins dépendant du warmup. En Post-LN, chaque couche re-normalise le résiduel, ce qui complique la propagation, d'où la sensibilité au warmup. En Pre-LN, le résiduel croît avec la profondeur, donc une **norme finale** avant la tête est indispensable.
+
+Évolutions récentes : Hyper-Connections et mHC élargissent le chemin résiduel avec des contraintes de stabilité.
+
+---
+
+## 8. Réseaux feed-forward (FFN)
+
+### 8.1 Rôle
+
+Le FFN applique à chaque position une transformation non linéaire, avec environ $2/3$ des paramètres d'un bloc. Il stocke en grande partie la « mémoire » du modèle.
+
+### 8.2 FFN classique et activations
+
+$$
+\mathrm{FFN}(x)=W_2\,\sigma(W_1x),\qquad W_1\in\mathbb R^{d_{ff}\times d},\ d_{ff}=4d,
+$$
+
+$$
+\mathrm{ReLU}(x)=\max(0,x),\quad \mathrm{GELU}(x)=x\,\Phi(x),\quad \mathrm{SiLU}(x)=x\,\sigma(x)=\frac{x}{1+e^{-x}}.
+$$
+
+### 8.3 Variantes à porte (GLU)
+
+$$
+\mathrm{FFN}_{\mathrm{GLU}}(x)=W_2\big(\sigma(W_gx)\odot W_ux\big).
+$$
+
+Avec $\sigma=$ SiLU on obtient **SwiGLU** (LLaMA, Mistral, Qwen, DeepSeek) ; avec GELU, **GeGLU** (Gemma) ; avec ReLU, ReGLU. La porte apprend à filtrer multiplicativement.
+
+### 8.4 Comparer à nombre de paramètres égal
+
+Deux matrices : $2\cdot d\cdot 4d=8d^2$ paramètres. Trois matrices de largeur $d_{ff}$ : $3\,d\,d_{ff}$. Pour conserver $8d^2$ :
+
+$$
+d_{ff}=\tfrac23\cdot4d=\tfrac83\,d\quad(\text{arrondi}).
+$$
+
+Comparer un FFN à porte et un FFN classique sans ajuster $d_{ff}$ revient à comparer des tailles de modèle, pas des architectures.
+
+---
+
+## 9. Mixture of Experts (MoE)
+
+### 9.1 Le problème
+
+Augmenter la capacité (paramètres) augmente le calcul par token. On voudrait **beaucoup de paramètres mais peu de calcul actif**.
+
+### 9.2 Principe
+
+On remplace le FFN par $E$ experts $f_1,\dots,f_E$ (chacun un petit FFN) et un routeur. Chaque token n'active que $k\ll E$ experts :
+
+$$
+s=\mathrm{softmax}(W_rx)\in\mathbb R^E,\qquad \mathcal T=\mathrm{TopK}(s,k),\qquad g_i=\frac{s_i}{\sum_{j\in\mathcal T}s_j},\qquad y=\sum_{i\in\mathcal T}g_i\,f_i(x).
+$$
+
+Paramètres **totaux** $\approx E\times$ (FFN), calcul **actif** $\approx k\times$ (FFN). Le coût reste la mémoire des poids, la communication entre dispositifs et l'équilibrage de charge.
+
+### 9.3 Le problème de l'équilibrage
+
+Sans contrainte, le routeur envoie tout vers quelques experts (effondrement) : capacité gaspillée et goulots en parallélisme d'experts.
+
+**Perte d'équilibrage (Switch)** : soit $f_i$ la fraction de tokens dont le top-$k$ contient l'expert $i$, et $P_i$ la probabilité moyenne du routeur pour $i$ :
+
+$$
+\mathcal L_{\mathrm{bal}}=\alpha\,E\sum_{i=1}^{E}f_i\,P_i,\qquad f_i=\frac{1}{kT}\sum_{t}\mathbb 1[i\in\mathcal T_t],\quad P_i=\frac1T\sum_t s_{t,i}.
+$$
+
+$f_i$ n'est pas différentiable (seul $P_i$ reçoit du gradient). Le minimum vaut $\alpha$, atteint pour une charge uniforme ($f_i=P_i=1/E$). Si la charge se concentre, la valeur augmente.
+
+**z-loss** (ST-MoE), stabilise les logits du routeur :
+
+$$
+\mathcal L_z=\beta\,\mathbb E_t\Big[\big(\log\textstyle\sum_{i}e^{z_{t,i}}\big)^2\Big].
+$$
+
+### 9.4 Variantes du routage
+
+- **Routage par token (top-$k$)** : décrit ci-dessus.
+- **Capacité** : au plus $C=\lceil \mathrm{cf}\cdot kT/E\rceil$ tokens par expert. Le surplus est **abandonné** (le token ne reçoit que le résiduel), ce qui permet des calculs de taille statique.
+- **Sans perte auxiliaire (DeepSeek-V3)** : les scores sont $s_i=\sigma(u^\top e_i)$ ; un biais $b_i$ sert **uniquement à la sélection** ($\mathrm{TopK}(s_i+b_i)$) et pas à la pondération. Il est ajusté selon la charge $c_i$ :
+$$
+b_i\leftarrow b_i+\gamma\,\mathrm{sign}(\bar c-c_i).
+$$
+  Cela évite qu'une perte auxiliaire interfère avec le gradient principal.
+- **Expert Choice** : chaque expert choisit ses $c=kT/E$ meilleurs tokens. Charge **parfaitement équilibrée**, mais **non causal** (le choix dépend des autres tokens du lot), donc inutilisable en génération sans adaptation.
+- **Experts fins et partagés (DeepSeekMoE)** : on découpe chaque expert en $m$ experts plus petits (et on active $mk$ experts) pour des combinaisons plus fines, et on ajoute des experts **partagés** toujours actifs pour le savoir commun :
+$$
+y=\sum_{j\in\text{partagés}}f_j(x)+\sum_{i\in\mathcal T}g_i\,f_i(x).
+$$
+
+### 9.5 Comparaison
+
+| Variante | Équilibrage | Particularité |
+|---|---|---|
+| top-2 + Switch (Mixtral, Switch) | pénalité | simple |
+| + z-loss | pénalité + stabilité | logits du routeur bornés |
+| sans perte auxiliaire (DeepSeek-V3) | biais de sélection | pas de gradient parasite |
+| Expert Choice | parfait par construction | non causal |
+| capacité | — | tokens abandonnés |
+| fin + partagé | pénalité ou biais | spécialisation + savoir commun |
+
+---
+
+## 10. Le Transformer complet : paramètres et calcul
+
+### 10.1 Bloc (Pre-norm)
+
+$$
+h\leftarrow x+\mathrm{Attn}\big(\mathrm{Norm}(x)\big),\qquad y\leftarrow h+\mathrm{FFN\ ou\ MoE}\big(\mathrm{Norm}(h)\big).
+$$
+
+Modèle : embeddings $\to N$ blocs $\to$ norme finale $\to$ tête $\to$ logits.
+
+### 10.2 Nombre de paramètres
+
+Par couche (MHA et FFN classique de largeur $4d$) : $4d^2+8d^2=12d^2$. Au total :
+
+$$
+N_{\text{params}}\approx 12\,n_L\,d^2+V\,d.
+$$
+
+Pour un MoE, on distingue $N_{\text{total}}$ et $N_{\text{actif}}$ (seuls $k$ experts plus les partagés comptent dans le calcul).
+
+### 10.3 Calcul d'entraînement
+
+Environ $2N$ FLOPs par token en passe avant et $4N$ en passe arrière, soit :
+
+$$
+C\approx 6\,N\,D\quad(D=\text{nombre de tokens}).
+$$
+
+Pour un MoE, $N$ désigne les paramètres **actifs**.
+
+### 10.4 Lois d'échelle
+
+La perte décroît en loi de puissance avec $N$ et $D$ (Kaplan et al.). Chinchilla (Hoffmann et al.) modélise $L(N,D)=E+A/N^{\alpha}+B/D^{\beta}$. À budget de calcul fixé, $N$ et $D$ doivent croître ensemble, avec environ 20 tokens par paramètre en ordre de grandeur. C'est le régime « compute-optimal » ; beaucoup de modèles récents sont volontairement sur-entraînés pour réduire le coût d'inférence.
+
+---
+
+## 11. Entraînement
+
+### 11.1 Gradient de la perte
+
+Pour un logit $z$ et une cible $y$ (one-hot), $\dfrac{\partial\mathcal L}{\partial z}=\mathrm{softmax}(z)-y$. La rétropropagation en déduit les gradients de tous les paramètres. Le mini-lot donne une estimation $g_t=\nabla_\theta\mathcal L_{B_t}(\theta_t)$.
+
+### 11.2 Optimiseurs
+
+**SGD** : $\theta_{t+1}=\theta_t-\eta\,g_t$. Un pas unique pour tous les paramètres ; sensible au conditionnement.
+
+**Momentum** (Polyak, convention PyTorch) :
+$$
+v_t=\mu\,v_{t-1}+g_t,\qquad \theta_{t+1}=\theta_t-\eta\,v_t.
+$$
+
+**Nesterov** (gradient « anticipé ») :
+$$
+v_t=\mu\,v_{t-1}+g_t,\qquad \theta_{t+1}=\theta_t-\eta\,(g_t+\mu\,v_t).
+$$
+
+**Adagrad** :
+$$
+G_t=G_{t-1}+g_t^{2},\qquad \theta_{t+1}=\theta_t-\eta\,\frac{g_t}{\sqrt{G_t}+\varepsilon}.
+$$
+
+**RMSprop** :
+$$
+s_t=\alpha\,s_{t-1}+(1-\alpha)\,g_t^2,\qquad \theta_{t+1}=\theta_t-\eta\,\frac{g_t}{\sqrt{s_t}+\varepsilon}.
+$$
+
+**Adam** :
+$$
+m_t=\beta_1m_{t-1}+(1-\beta_1)g_t,\qquad v_t=\beta_2v_{t-1}+(1-\beta_2)g_t^2,
+$$
+$$
+\hat m_t=\frac{m_t}{1-\beta_1^{\,t}},\qquad \hat v_t=\frac{v_t}{1-\beta_2^{\,t}},\qquad \theta_{t+1}=\theta_t-\eta\,\frac{\hat m_t}{\sqrt{\hat v_t}+\varepsilon}.
+$$
+
+*Correction de biais* : comme $m_0=v_0=0$, on a $\mathbb E[m_t]=(1-\beta_1^t)\,\mathbb E[g]$ pour un gradient stationnaire. Diviser par $1-\beta_1^t$ rend l'estimation non biaisée. Sans elle, les premiers pas seraient trop petits, surtout pour $v$ avec $\beta_2=0{,}999$.
+
+**Adam avec régularisation $L_2$** : on remplace $g_t\leftarrow g_t+\lambda\theta_t$ **avant** de calculer $m_t$ et $v_t$.
+
+**AdamW** (weight decay découplé) :
+$$
+\theta_{t+1}=\theta_t-\eta\left(\frac{\hat m_t}{\sqrt{\hat v_t}+\varepsilon}+\lambda\,\theta_t\right).
+$$
+
+*Pourquoi cela change tout* : en Adam-$L_2$, le terme $\lambda\theta_t$ est divisé par $\sqrt{\hat v_t}\approx\sigma$ (échelle du gradient). La décroissance effective vaut donc environ $\eta\lambda/\sigma$ : un paramètre à gros gradient est peu régularisé, un paramètre à petit gradient l'est beaucoup. En AdamW, la décroissance est $\eta\lambda\theta_t$ pour tous, indépendante de l'échelle du gradient, donc $\lambda$ est interprétable et transférable.
+
+**Lion** :
+$$
+u_t=\mathrm{sign}\big(\beta_1m_{t-1}+(1-\beta_1)g_t\big),\qquad \theta_{t+1}=\theta_t-\eta\,(u_t+\lambda\theta_t),\qquad m_t=\beta_2m_{t-1}+(1-\beta_2)g_t.
+$$
+Chaque coordonnée bouge de $\pm\eta$ ; le learning rate doit être de l'ordre de 3 à 10 fois plus petit qu'avec AdamW.
+
+**Muon** (matrices 2D $W\in\mathbb R^{n\times m}$ des couches cachées) :
+$$
+M_t=\mu M_{t-1}+G_t,\qquad O_t=\mathrm{NS}\big(G_t+\mu M_t\big)\approx UV^\top,\qquad W_{t+1}=W_t-\eta\,c\,O_t,
+$$
+où $\mathrm{NS}$ est l'itération de Newton-Schulz $X_{k+1}=aX_k+b\,X_kX_k^\top X_k+c'\,(X_kX_k^\top)^2X_k$ (avec $(a,b,c')=(3{,}4445,-4{,}7750,2{,}0315)$, départ $X_0=G/\|G\|_F$) et $c=0{,}2\sqrt{\max(n,m)}$ aligne l'échelle de mise à jour sur celle d'AdamW. Embeddings, normes et tête restent en AdamW.
+
+| Optimiseur | États / paramètre | Idée |
+|---|---|---|
+| SGD | 0 | pas fixe |
+| Momentum / Nesterov | 1 | inertie |
+| Adagrad / RMSprop | 1 | échelle par coordonnée |
+| Adam / AdamW | 2 | inertie et échelle |
+| Lion | 1 | signe |
+| Muon | 1 | orthogonalisation |
+
+En précision mixte, l'entraînement avec Adam coûte de l'ordre de 16 octets par paramètre (poids, gradients, poids maîtres fp32 et deux moments). Le weight decay ne s'applique pas aux normes, biais et embeddings.
+
+### 11.3 Schedules du learning rate
+
+Avec $p=\dfrac{t-T_w}{T-T_w}\in[0,1]$ et un plancher $\rho=\eta_{\min}/\eta_{\max}$ :
+
+- **Warmup** : $\eta_t=\eta_{\max}\,\dfrac{t+1}{T_w}$ pour $t<T_w$. Il évite les premiers pas instables (estimation de $v$ mal calibrée).
+- **Cosinus** : $\eta_t=\eta_{\max}\Big[\rho+\tfrac{1-\rho}{2}\big(1+\cos\pi p\big)\Big]$.
+- **Linéaire** : $\eta_t=\eta_{\max}\big[1-(1-\rho)p\big]$.
+- **Inverse racine** : $\eta_t=\eta_{\max}\sqrt{T_w/t}$.
+- **WSD** (Warmup-Stable-Decay) : plateau à $\eta_{\max}$ puis décroissance linéaire sur la fraction finale $\delta$ des pas. Permet de prolonger l'entraînement sans connaître le budget à l'avance.
+
+### 11.4 Stabilité et efficacité
+
+- **Écrêtage du gradient** : $g\leftarrow g\cdot\min\big(1,\,c/\|g\|_2\big)$. Protège contre les pics de gradient.
+- **Accumulation** : $K$ micro-lots de taille $b$ équivalent à un lot de taille $Kb$ si l'on divise chaque perte par $K$. C'est exact, sauf pour les couches dépendant de statistiques du lot (BatchNorm, MoE avec capacité par lot, Expert Choice).
+- **Précision mixte** : bf16 = 1 bit de signe, 8 d'exposant, 7 de mantisse (même plage que fp32, précision relative $\approx 2^{-8}$). fp16 = 1, 5, 10 : plage réduite, donc un *loss scaling* est nécessaire. Les poids maîtres et statistiques restent en fp32.
+- **Gradient checkpointing** : on ne stocke que certaines activations et on recalcule le reste pendant la rétropropagation. On gagne en mémoire (de $O(L)$ à environ $O(\sqrt L)$) au prix d'environ 33 % de calcul en plus.
+- **EMA des poids** : $\bar\theta\leftarrow\delta\bar\theta+(1-\delta)\theta$, évalué à la place du modèle courant.
+- **z-loss sur les logits** (PaLM) : $+\,z\cdot\mathbb E\big[(\log\sum_i e^{z_i})^2\big]$ avec $z\sim10^{-4}$.
+- **Label smoothing** : cible lissée $(1-\epsilon)\,y+\epsilon/V$.
+
+---
+
+## 12. Génération
+
+### 12.1 Le problème
+
+À chaque pas, le modèle donne une distribution. Le choix du token est une **décision de décodage**, indépendante de l'entraînement, qui arbitre entre qualité (cohérence) et diversité.
+
+### 12.2 Stratégies d'échantillonnage
+
+- **Glouton** : $\arg\max_i z_i$. Déterministe ; tend à répéter.
+- **Température** : $p_i=\mathrm{softmax}(z_i/T)$. $T<1$ rend la distribution plus nette, $T>1$ plus aléatoire ; $T\to0$ redonne le glouton.
+- **Top-$k$** : on garde les $k$ tokens les plus probables.
+- **Top-$p$ (noyau)** : plus petit ensemble dont la masse cumulée atteint $p$. Sa taille s'adapte à la distribution.
+- **Min-$p$** : on garde les tokens tels que $p_i\ge p_{\min}\cdot\max_jp_j$ (seuil relatif au meilleur token).
+- **Pénalité de répétition** : pour les tokens déjà générés, $z_i\leftarrow z_i/\theta$ si $z_i>0$, sinon $z_i\cdot\theta$ (avec $\theta>1$).
+
+### 12.3 Décodage spéculatif
+
+**Problème** : chaque pas exige une passe complète du grand modèle, donc la latence est élevée.
+
+**Solution** : un petit modèle *brouillon* propose $\gamma$ tokens ; le grand modèle les **vérifie en une seule passe parallèle** et l'on garde le plus long préfixe validé, plus un token du grand modèle. En glouton, la sortie est **identique** à celle du grand modèle seul. Avec un taux d'acceptation $\alpha$ supposé i.i.d., le nombre moyen de tokens par appel du grand modèle est :
+
+$$
+\mathbb E[\text{tokens/appel}]=\frac{1-\alpha^{\gamma+1}}{1-\alpha}.
+$$
+
+**Mesures du dépôt (notebook 14)** :
+
+- La sortie est identique au modèle cible pour $\gamma=1,2,4,8$.
+- Tokens par appel mesurés : $1{,}82,\ 2{,}55,\ 3{,}64,\ 5{,}0$, au-dessus de la formule i.i.d. à partir de $\gamma=4$ : l'acceptation est fortement corrélée entre positions.
+- Le modèle évalué ne maîtrise pas complètement la grammaire du corpus synthétique (environ 50 % de phrases valides même en glouton). Les comparaisons entre réglages d'échantillonnage (top-$p$, min-$p$…) y sont donc peu concluantes. La validité baisse quand la température augmente.
+- Seule la variante gloutonne est implémentée, pas l'échantillonnage avec rejet probabiliste.
+
+---
+
+## 13. Panorama des LLM modernes
+
+Synthèse de lecture des rapports techniques, **à vérifier cellule par cellule avant citation** (les détails varient selon la taille et la version).
+
+| Modèle | Position | Norme | FFN | Attention | Particularités |
+|---|---|---|---|---|---|
+| GPT-2 | appris | LayerNorm (Pre-LN), biais | GELU | MHA | BPE octets, poids liés |
+| LLaMA | RoPE | RMSNorm (Pre) | SwiGLU | MHA | sans biais |
+| Llama 2 | RoPE | RMSNorm | SwiGLU | MHA ; GQA pour 34B/70B | contexte 4096 |
+| Llama 3 | RoPE (base 500 000) | RMSNorm | SwiGLU | GQA (8 têtes KV) | vocabulaire 128 K, contexte étendu |
+| Mistral 7B | RoPE | RMSNorm | SwiGLU | GQA et fenêtre glissante | cache roulant |
+| Mixtral 8x7B | RoPE | RMSNorm | SwiGLU (experts) | GQA | MoE 8 experts, top-2 |
+| Qwen2 / Qwen3 | RoPE | RMSNorm | SwiGLU | GQA (Qwen3 : QK-Norm) | variantes MoE |
+| Gemma 2 / 3 | RoPE | RMSNorm | GeGLU | GQA, couches locales/globales | soft-capping (2), QK-Norm (3) |
+| DeepSeek-V2 / V3 | RoPE découplé | RMSNorm | SwiGLU | **MLA** | DeepSeekMoE, équilibrage sans perte auxiliaire (V3), prédiction multi-tokens (V3) |
+
+**Tendance** : décodeur, Pre-norm RMSNorm, RoPE, SwiGLU, sans biais, GQA. Les différences se jouent sur :
+
+1. la réduction du cache KV (GQA vers MLA) ;
+2. la parcimonie (MoE) ;
+3. le contexte long (attention locale/globale, extension de RoPE) ;
+4. la stabilité (QK-Norm, z-loss, écrêtage, WSD).
+
+**Guide de sélection** :
+
+| Contrainte dominante | Choix usuel |
+|---|---|
+| Mémoire d'inférence, long contexte | GQA vers MLA ; fenêtre ; quantification du cache |
+| Qualité par FLOP d'entraînement | MoE fin avec experts partagés et équilibrage sans perte auxiliaire |
+| Stabilité à grande échelle | Pre-norm RMSNorm, QK-Norm, z-loss, écrêtage, WSD |
+| Simplicité et reproductibilité | LLaMA-style dense avec GQA |
+
+**Comparaison « à style » à échelle réduite (notebook 15)** : GPT-2-style est très en retrait (positions apprises sur budget court) ; Qwen3-style (GQA et QK-Norm) a la meilleure moyenne ; LLaMA-1-style et Mistral-style sont proches ; Llama-3-style est moins bon que LLaMA-1-style (deux changements coïncident, GQA et base RoPE, donc non séparables) ; les styles MoE ne battent pas le dense, avec plus de paramètres totaux. Le cache KV passe de 128 valeurs par token et par couche (MHA) à 32 (GQA) et 24 (MLA). Ce n'est pas un classement des modèles réels.
+
+
+---
+
+## . Références
+
+À vérifier avant tout dépôt (identifiants arXiv, versions, venues). Seules Qwen3 et mHC ont été recontrôlées en ligne ; les autres viennent de ma mémoire. La liste complète, avec clés BibTeX, est dans `docs/REFERENCES.md` et `docs/references.bib` du dépôt.
+
+**Tokenisation** : Gage (1994) ; Sennrich, Haddow & Birch (2016), BPE, arXiv:1508.07909 ; Wu et al. (2016), GNMT/WordPiece, arXiv:1609.08144 ; Kudo (2018), Unigram, arXiv:1804.10959 ; Kudo & Richardson (2018), SentencePiece, arXiv:1808.06226 ; Radford et al. (2019), GPT-2.
+
+**Embeddings** : Mikolov et al. (2013), arXiv:1301.3781 ; Press & Wolf (2017), weight tying, arXiv:1608.05859.
+
+**Positions** : Vaswani et al. (2017), *Attention Is All You Need*, arXiv:1706.03762 ; Su et al. (2021), RoPE, arXiv:2104.09864 ; Press et al. (2022), ALiBi, arXiv:2108.12409 ; Kazemnejad et al. (2023), NoPE, arXiv:2305.19466 ; Chen et al. (2023), Position Interpolation, arXiv:2306.15595 ; Peng et al. (2023), YaRN, arXiv:2309.00071.
+
+**Attention et cache** : Shazeer (2019), MQA, arXiv:1911.02150 ; Ainslie et al. (2023), GQA, arXiv:2305.13245 ; DeepSeek-AI (2024), DeepSeek-V2 (MLA), arXiv:2405.04434 ; Beltagy et al. (2020), Longformer, arXiv:2004.05150 ; Jiang et al. (2023), Mistral 7B, arXiv:2310.06825 ; Dao et al. (2022), FlashAttention, arXiv:2205.14135 ; Dao (2023), FlashAttention-2, arXiv:2307.08691 ; Kwon et al. (2023), PagedAttention, arXiv:2309.06180 ; Pope et al. (2022), arXiv:2211.05102 ; Xiao et al. (2024), StreamingLLM, arXiv:2309.17453 ; Liu et al. (2024), KIVI, arXiv:2402.02750 ; Hooper et al. (2024), KVQuant, arXiv:2401.18079.
+
+**Normalisation** : Ba et al. (2016), LayerNorm, arXiv:1607.06450 ; Zhang & Sennrich (2019), RMSNorm, arXiv:1910.07467 ; Xiong et al. (2020), Pre-LN, arXiv:2002.04745 ; Henry et al. (2020), QK-Norm, arXiv:2010.04245 ; Dehghani et al. (2023), ViT-22B, arXiv:2302.05442 ; He et al. (2016), ResNet, arXiv:1512.03385 ; Zhu et al. (2024), Hyper-Connections, arXiv:2409.19606 ; Xie et al. (2025), mHC, arXiv:2512.24880.
+
+**FFN** : Dauphin et al. (2017), GLU, arXiv:1612.08083 ; Shazeer (2020), GLU variants, arXiv:2002.05202 ; Hendrycks & Gimpel (2016), GELU, arXiv:1606.08415 ; Ramachandran et al. (2017), Swish, arXiv:1710.05941.
+
+**MoE** : Shazeer et al. (2017), arXiv:1701.06538 ; Lepikhin et al. (2021), GShard, arXiv:2006.16668 ; Fedus et al. (2022), Switch, arXiv:2101.03961 ; Zoph et al. (2022), ST-MoE, arXiv:2202.08906 ; Zhou et al. (2022), Expert Choice, arXiv:2202.09368 ; Jiang et al. (2024), Mixtral, arXiv:2401.04088 ; Dai et al. (2024), DeepSeekMoE, arXiv:2401.06066 ; Wang et al. (2024), équilibrage sans perte auxiliaire, arXiv:2408.15664 ; DeepSeek-AI (2024), DeepSeek-V3, arXiv:2412.19437 ; Muennighoff et al. (2024), OLMoE, arXiv:2409.02060.
+
+**Modèles** : Touvron et al. (2023), LLaMA, arXiv:2302.13971 ; Llama 2, arXiv:2307.09288 ; Llama Team (2024), Llama 3, arXiv:2407.21783 ; Qwen Team (2024), Qwen2, arXiv:2407.10671 ; Qwen3 (2025), arXiv:2505.09388 ; Gemma Team (2024), Gemma 2, arXiv:2408.00118 ; Gemma 3 (2025), arXiv:2503.19786.
+
+**Optimisation** : Polyak (1964) ; Nesterov (1983) ; Sutskever et al. (2013) ; Duchi et al. (2011), Adagrad ; Tieleman & Hinton (2012), RMSprop ; Kingma & Ba (2015), Adam, arXiv:1412.6980 ; Loshchilov & Hutter (2019), AdamW, arXiv:1711.05101 ; Reddi et al. (2018), arXiv:1904.09237 ; Shazeer & Stern (2018), Adafactor, arXiv:1804.04235 ; Chen et al. (2023), Lion, arXiv:2302.06675 ; Jordan et al. (2024), Muon (billet de blog) ; Liu et al. (2025), Moonlight, arXiv:2502.16982 ; Loshchilov & Hutter (2017), SGDR, arXiv:1608.03983 ; Goyal et al. (2017), warmup, arXiv:1706.02677 ; Hu et al. (2024), MiniCPM/WSD, arXiv:2404.06395 ; Pascanu et al. (2013), écrêtage, arXiv:1211.5063 ; Micikevicius et al. (2018), précision mixte, arXiv:1710.03740 ; Chen et al. (2016), checkpointing, arXiv:1604.06174 ; Chowdhery et al. (2022), PaLM (z-loss), arXiv:2204.02311 ; Kaplan et al. (2020), arXiv:2001.08361 ; Hoffmann et al. (2022), Chinchilla, arXiv:2203.15556.
+
+**Génération** : Holtzman et al. (2020), top-$p$, arXiv:1904.09751 ; Nguyen et al. (2024), min-$p$, arXiv:2407.01082 ; Keskar et al. (2019), CTRL (pénalité de répétition), arXiv:1909.05858 ; Leviathan et al. (2023), décodage spéculatif, arXiv:2211.17192 ; Gloeckle et al. (2024), prédiction multi-tokens, arXiv:2404.19737.

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llm-from-scratch-experimental-study"
+version = "0.2.0"
+description = "Étude expérimentale et pédagogique des LLM modernes (tokenizers, attention, KV cache, MoE, optimiseurs) implémentés from scratch avec PyTorch."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.2", "numpy>=1.24", "PyYAML>=6.0"]
+
+[project.optional-dependencies]
+experiments = ["matplotlib>=3.7", "jupyter>=1.0", "ipykernel>=6.25", "nbformat>=5.9", "nbclient>=0.10"]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+llm-prepare = "llm.cli:prepare_main"
+llm-train = "llm.cli:train_main"
+llm-evaluate = "llm.cli:evaluate_main"
+llm-generate = "llm.cli:generate_main"
+llm-tokenizer = "llm.cli:tokenizer_main"
+llm-experiments = "llm.cli:experiments_main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/llm"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

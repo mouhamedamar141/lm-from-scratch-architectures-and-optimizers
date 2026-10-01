@@ -1,0 +1,30 @@
+# Configuration minimale pour vérifier le pipeline sur CPU (quelques secondes).
+seed: 0
+device: auto
+data:
+  corpus: data/raw/corpus.txt
+  tokenizer: data/tokenizer/tokenizer.json
+  train_tokens: data/processed/train.bin
+  val_tokens: data/processed/val.bin
+  val_fraction: 0.1
+model:            # voir src/llm/model/config.py pour toutes les options
+  block_size: 32
+  n_layer: 2
+  n_head: 4
+  n_embd: 32
+  position_mode: rope
+  norm_type: rmsnorm
+  ffn_type: swiglu
+  attn_type: mha
+training:         # voir src/llm/training/trainer.py (TrainConfig)
+  steps: 60
+  batch_size: 8
+  lr: 0.003
+  weight_decay: 0.1
+  optimizer: adamw
+  schedule: warmup_cosine
+  warmup_steps: 6
+  grad_clip: 1.0
+  eval_interval: 20
+  eval_iters: 4
+  checkpoint: checkpoints/tiny.pt

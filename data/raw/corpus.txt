@@ -1,0 +1,12 @@
+Le langage est un outil pour penser, apprendre et partager des idées. Un modèle apprend des régularités en observant des exemples, mais ses sorties ne sont pas des vérités garanties.
+Un Transformer traite des séquences de tokens. L'attention causale permet à chaque position de regarder le passé sans révéler les tokens futurs. Les résidus facilitent la circulation de l'information dans les couches.
+Les expériences scientifiques comparent des hypothèses avec un protocole contrôlé. Nous gardons les données, la graine, le budget d'entraînement et les mesures identiques, puis nous changeons un seul facteur à la fois.
+Les caractères sont simples et couvrent les mots nouveaux, mais les séquences deviennent longues. Les mots raccourcissent les séquences, mais un vocabulaire fermé rencontre des mots inconnus. Les sous-mots cherchent un compromis.
+Les paramètres ne remplacent pas les données. Une petite expérience permet de vérifier les formes des tenseurs, la propagation des gradients et la baisse de la loss, sans prétendre démontrer une loi universelle.
+A language model predicts the next token from the context that came before it. Training minimizes cross entropy on held-out text. Validation loss and perplexity describe different views of the same prediction objective.
+Attention uses queries, keys, and values. A causal mask blocks information from future positions. Multiple heads can represent different relationships, while more heads also affect computation and memory.
+A tokenizer maps text to discrete ids and decodes those ids back into text. Byte pair encoding repeatedly merges frequent adjacent symbols. A unigram model scores candidate pieces and selects a likely segmentation.
+Layer normalization centers and scales activations. RMS normalization scales by root mean square without subtracting the mean. Neither choice is universally best for every model, data set, or compute budget.
+A feed-forward network transforms each position independently. GELU, ReLU, and SwiGLU are alternative nonlinearities or gated structures. Comparisons should report parameter count and compute, not only final loss.
+AdamW applies decoupled weight decay. A learning-rate warmup can ease early optimization, and cosine decay gradually reduces the step size. Gradient clipping limits unusually large updates but does not repair every training problem.
+Generation can choose the most likely next token or sample from a filtered distribution. Temperature, top-k, and top-p control diversity. The best setting depends on the prompt and desired behavior.

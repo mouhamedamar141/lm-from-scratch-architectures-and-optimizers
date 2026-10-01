@@ -1,0 +1,2 @@
+# Style GPT-2 : positions apprises, LayerNorm Pre-LN, FFN GELU, biais, MHA.
+model: {position_mode: learned, norm_type: layernorm, ffn_type: gelu, bias: true, attn_type: mha, tie_weights: true}
